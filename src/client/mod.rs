@@ -152,7 +152,6 @@ impl Client {
         self.request(Method::Delete, url)
     }
 
-
     /// Build a new request using this Client.
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder<U> {
         RequestBuilder {

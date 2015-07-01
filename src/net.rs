@@ -242,6 +242,80 @@ impl NetworkConnector for HttpConnector {
 }
 
 
+/// A connector that will produce HttpStreams.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectProxyHttpConnector {
+    proxy_host: String,
+    proxy_port: u16,
+}
+
+impl ConnectProxyHttpConnector {
+    /// Create a new Connector which will use a CONNECT proxy at the given host and port
+    pub fn new(proxy_host: &str, proxy_port: u16) -> ConnectProxyHttpConnector {
+        ConnectProxyHttpConnector{
+            proxy_host: proxy_host.to_string(),
+            proxy_port: proxy_port,
+        }
+    }
+}
+
+fn connect_proxy_prelude<S: Read+Write>(stream: &mut S, host: &str, port: u16) -> ::Result<()> {
+    try!(stream.write_all(format!("\
+            CONNECT {host}:{port} HTTP/1.1\r\n\
+            User-Agent: hyper\r\n\
+            Host: {host}\r\n\
+            Content-Length: 0\r\n\
+            Proxy-Connection: Keep-Alive\r\n\
+            Pragma: no-cache\r\n\
+            \r\n\
+            ", host = host, port = port).as_bytes()));
+        
+    let mut header: Vec<u8> = Vec::new();
+    let mut header_len = 0;
+    loop {
+        if header_len >= header.len()/2 {
+            header.extend(::std::iter::repeat(0).take(header_len+500));
+        }
+        println!("Reading {} to {}", header_len, header.len());
+        let read_len = try!(stream.read(&mut header[header_len..]));
+        if read_len==0 {
+            return Err(::Error::Method); // TODO: This is not really an appropriate error
+        }
+        
+        header_len += read_len;
+        
+        println!("{:?}", String::from_utf8(header[..header_len].to_vec()));
+        
+        if header[..header_len].ends_with(b"\r\n\r\n") {
+            println!("Found the end!");
+            return Ok( () )
+        }
+    }
+}
+
+impl NetworkConnector for ConnectProxyHttpConnector {
+    type Stream = HttpStream;
+
+    fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<HttpStream> {
+        let host_str: &str = &self.proxy_host;
+        let proxy_addr = &(host_str, self.proxy_port);
+        let mut stream = try!(TcpStream::connect(proxy_addr));
+        
+        try!(connect_proxy_prelude(&mut stream, &host, port));
+        
+        Ok(try!(match scheme {
+            "http" => {
+                debug!("http scheme");
+                Ok(HttpStream(stream))
+            },
+            _ => {
+                Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                "Invalid scheme for Http"))
+            }
+        }))
+    }
+}
+
 /// An abstraction to allow any SSL implementation to be used with HttpsStreams.
 pub trait Ssl {
     /// The protected stream.
@@ -369,6 +443,49 @@ impl<S: Ssl> NetworkConnector for HttpsConnector<S> {
 }
 
 
+/// A connector that will produce HttpStreams.
+#[derive(Debug, Default)]
+pub struct ConnectProxyHttpsConnector<S: Ssl> {
+    proxy_host: String,
+    proxy_port: u16,
+    ssl: S
+}
+
+impl<S: Ssl+Default> ConnectProxyHttpsConnector<S> {
+    /// Create a new Connector which will use a CONNECT proxy at the given host and port
+    pub fn new(proxy_host: &str, proxy_port: u16) -> ConnectProxyHttpsConnector<S> {
+        ConnectProxyHttpsConnector{
+            proxy_host: proxy_host.to_string(),
+            proxy_port: proxy_port,
+            ssl: Default::default(),
+        }
+    }
+}
+
+impl<S: Ssl> NetworkConnector for ConnectProxyHttpsConnector<S> {
+    type Stream = HttpsStream<S::Stream>;
+
+    fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<Self::Stream> {
+        let host_str: &str = &self.proxy_host;
+        let proxy_addr = &(host_str, self.proxy_port);
+        let mut stream = try!(TcpStream::connect(proxy_addr));
+        
+        try!(connect_proxy_prelude(&mut stream, &host, port));
+        
+        Ok(try!(if scheme == "https" {
+            debug!("https scheme");
+            let stream = HttpStream(stream);
+            self.ssl.wrap_client(stream, host).map(HttpsStream::Https)
+        } else if scheme == "http" {
+            Ok(HttpsStream::Http(HttpStream(stream)))
+        } else {
+            Err(From::from( io::Error::new(io::ErrorKind::InvalidInput,
+                            "Invalid scheme for Http")) )
+        }))
+    }
+}
+
+
 #[cfg(not(feature = "openssl"))]
 #[doc(hidden)]
 pub type DefaultConnector = HttpConnector;
@@ -376,6 +493,11 @@ pub type DefaultConnector = HttpConnector;
 #[cfg(feature = "openssl")]
 #[doc(hidden)]
 pub type DefaultConnector = HttpsConnector<self::openssl::Openssl>;
+
+/// CONNECT proxy using openssl
+#[cfg(feature = "openssl")]
+pub type DefaultConnectProxyHttpsConnector = ConnectProxyHttpsConnector<self::openssl::Openssl>;
+
 
 #[cfg(feature = "openssl")]
 mod openssl {
